@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""dex-later: end your run now and be woken later, instead of waiting for a long job.
+
+    dex-later --after '<command>' "note"   run the command in the background; you are woken when it ends
+    dex-later --in 30m "note"              you are woken after that time (1m to 7d; m, h or d)
+    dex-later "note"                       you are woken as soon as you are free
+
+The note is what you will read when you wake up, in the same chat: what to check and what to do then.
+After dex-later answers "Set", tell the person in one line and finish your run. Do not wait or sleep.
+
+--after keeps the command's output in ~/.dex/later/<id>.log and adds the exit code and that path to
+your note. The hub is asked over this computer's own socket (~/.dex/later.sock). Exit code 0 / 1.
+"""
+import json, os, re, socket, subprocess, sys, time
+
+SOCK = os.path.expanduser("~/.dex/later.sock")
+LOGS = os.path.expanduser("~/.dex/later")
+USAGE = ("Usage: dex-later --after '<command>' \"note\"   (woken when the command ends)\n"
+         "       dex-later --in 30m \"note\"              (woken after that time: 1m to 7d)\n"
+         "       dex-later \"note\"                       (woken as soon as you are free)")
+
+
+def ask(msg, wait=30):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(wait)
+    s.connect(SOCK)
+    s.sendall(json.dumps(msg).encode() + b"\n")
+    buf = b""
+    while b"\n" not in buf:
+        data = s.recv(65536)
+        if not data:
+            break
+        buf += data
+    s.close()
+    return json.loads(buf.split(b"\n")[0])
+
+
+def seconds(text):
+    m = re.fullmatch(r"(\d{1,5})\s*([mhd])", text.strip().lower())
+    if not m:
+        return None
+    return int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def background(command, note, ticket):
+    """Detached from the run (its own session): runs the command, then asks for the wake-up."""
+    if os.fork():
+        return
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    os.makedirs(LOGS, exist_ok=True)
+    log = os.path.join(LOGS, ticket + ".log")
+    null = os.open(os.devnull, os.O_RDWR)
+    out = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.dup2(null, 0), os.dup2(out, 1), os.dup2(out, 2)
+    started = time.time()
+    try:
+        code = subprocess.call(["/bin/bash", "-lc", command])
+    except OSError as e:
+        code = f"could not start ({e.strerror})"
+    took = int(time.time() - started)
+    text = (f"{note}\n\n(The command you left running ended after {took // 60} min {took % 60} s with exit code {code}. "
+            f"Its output is in {log.replace(os.path.expanduser('~'), '~', 1)}.)")
+    for wait in (0, 10, 30, 60, 120, 300, 600, 1800):     # the hub may be restarting: try for an hour
+        time.sleep(wait)
+        try:
+            reply = ask({"op": "later", "note": text[-1000:] if len(text) > 1000 else text, "seconds": 0, "ticket": ticket})
+        except (OSError, ValueError):
+            continue
+        print("dex-later:", reply.get("text"))
+        if reply.get("ok") or "check-backs" not in str(reply.get("text")):
+            break                                          # set, or refused for good (not just "too many now")
+    os._exit(0)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(USAGE)
+        return 1
+    wait, command = 0, None
+    while args and args[0] in ("--in", "--after"):
+        if len(args) < 2:
+            print(USAGE)
+            return 1
+        if args[0] == "--in":
+            wait = seconds(args[1])
+            if wait is None:
+                print("Not set: write the time as 30m, 2h or 1d.")
+                return 1
+        else:
+            command = args[1]
+        args = args[2:]
+    note = " ".join(args).strip()
+    if not note:
+        print("Not set: add a note for yourself: what to check and what to do then.")
+        return 1
+    if command is not None and wait:
+        print("Not set: use --after or --in, not both.")
+        return 1
+    try:
+        if command is not None:
+            if not command.strip():
+                print("Not set: --after needs a command.")
+                return 1
+            if len(note) > 700:
+                print("Not set: keep the note under 700 characters.")
+                return 1
+            reply = ask({"op": "hold", "note": note})
+            if not reply.get("ok"):
+                print(reply.get("text") or "Not set.")
+                return 1
+            background(command, note, reply["ticket"])
+            print(f"Set: the command runs in the background (output: ~/.dex/later/{reply['ticket']}.log). "
+                  "You will be woken in this chat when it ends. Tell the person in one line and finish now.")
+            return 0
+        reply = ask({"op": "later", "note": note, "seconds": wait})
+    except (OSError, ValueError, KeyError):
+        print("Not set: Dex could not be reached. Try again in a minute.")
+        return 1
+    print(reply.get("text") or ("Set." if reply.get("ok") else "Not set."))
+    return 0 if reply.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

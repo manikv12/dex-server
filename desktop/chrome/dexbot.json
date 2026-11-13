@@ -1,0 +1,13 @@
+{
+  "ApplicationLocaleValue": "en-US",
+  "ForcedLanguages": ["en-US"],
+  "SpellcheckLanguage": ["en-US"],
+  "TranslateEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "PromotionalTabsEnabled": false,
+  "MetricsReportingEnabled": false,
+  "HomepageLocation": "https://www.google.com/?hl=en&gl=us",
+  "NewTabPageLocation": "https://www.google.com/?hl=en&gl=us",
+  "ProxySettings": { "ProxyMode": "fixed_servers", "ProxyServer": "socks5://127.0.0.1:1080", "ProxyBypassList": "<-loopback>" },
+  "WebRtcIPHandling": "disable_non_proxied_udp"
+}

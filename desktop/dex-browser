@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""dex-browser: drive the visible Chrome by element, over the Chrome DevTools Protocol.
+
+Made for an AI agent calling it from a shell. Short plain-text output, one-line
+errors, exit code 1 on failure. Talks to http://127.0.0.1:9222 (DEX_BROWSER_PORT
+changes the port). Refs from `snapshot` are kept in ~/.dex/browser-state.json.
+
+  dex-browser tabs | open <url> [--new-tab] | tab <index> | back | reload
+  dex-browser snapshot [--all]
+  dex-browser click <ref> | type <ref> <text> [--clear] [--enter] | select <ref> <option>
+  dex-browser check <ref> on|off | focus <ref> | key <Enter|Tab|Escape|ArrowDown|Ctrl+A ...>
+  dex-browser scroll up|down|top|bottom | text [--max N] | find <words>
+  dex-browser wait [seconds | --for <text> [--timeout N]] | screenshot <file.png>
+
+Pop-ups: an alert is closed with OK and its text is printed. A confirm/prompt/leave-page
+question is answered Cancel unless the command has --accept-dialog (or --accept-dialog=<text>).
+"""
+import asyncio
+import base64
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("DEX_BROWSER_PORT", "9222"))
+STATE = os.path.expanduser(os.environ.get("DEX_BROWSER_STATE", "~/.dex/browser-state.json"))
+SNAPSHOT_CAP = 120
+ACCEPT_DIALOG = None  # set by --accept-dialog[=text]
+
+# Chrome is on this machine: never send its traffic through a proxy.
+for _k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+    os.environ.pop(_k, None)
+os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+
+
+class Fail(Exception):
+    pass
+
+
+class Timeout(Fail):
+    pass
+
+
+# ---------------------------------------------------------------- page script
+# Installed once per document (window.__dexAgent). Keeps ref -> element.
+JS = r"""
+(() => {
+  const W = window;
+  if (W.__dexAgent && W.__dexAgent.v === 3) return W.__dexAgent;
+  const D = { v: 3, doc: Math.random().toString(36).slice(2, 10), n: 0, byRef: new Map(), refOf: new WeakMap() };
+  Object.defineProperty(W, '__dexAgent', { value: D, configurable: true, enumerable: false, writable: true });
+  const ROLES = new Set(['button','link','checkbox','radio','switch','tab','menuitem','menuitemcheckbox','menuitemradio',
+    'option','combobox','textbox','searchbox','slider','spinbutton','treeitem','listbox','gridcell']);
+  const T = (s, n = 80) => { s = (s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+  const tagOf = el => (el.tagName || '').toLowerCase();
+  const SKIP = new Set(['script','style','noscript','template','head','meta','link','title']);
+
+  function secretKind(el) {
+    if (tagOf(el) !== 'input') return '';
+    const ty = (el.type || '').toLowerCase(), ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    const hint = [el.name, el.id, ac, el.getAttribute('aria-label'), el.placeholder, el.getAttribute('data-testid')]
+      .join(' ').toLowerCase();
+    if (ty === 'password' || /current-password|new-password/.test(ac)) return 'password';
+    if (ac.includes('one-time-code') || /(^|[^a-z])(otp|totp|2fa|mfa)([^a-z]|$)|one.?time|verification.?code|auth.?code|passcode|sms.?code|security.?code/.test(hint)) return 'one-time code';
+    if (/cc-number|cc-csc/.test(ac) || /card.?number|cardnum|cc.?num|(^|[^a-z])(cvv|cvc|csc)([^a-z]|$)/.test(hint)) return 'card number';
+    return '';
+  }
+  function roleOf(el) {
+    const r = (el.getAttribute('role') || '').trim().split(/\s+/)[0];
+    if (r && r !== 'presentation' && r !== 'none' && r !== 'generic') return r;
+    const t = tagOf(el);
+    if (t === 'a') return 'link';
+    if (t === 'button' || t === 'summary') return 'button';
+    if (t === 'select') return el.multiple ? 'listbox' : 'select';
+    if (t === 'textarea') return 'textbox';
+    if (t === 'input') {
+      const ty = (el.type || 'text').toLowerCase();
+      if (ty === 'checkbox' || ty === 'radio') return ty;
+      if (['submit','button','reset','image'].includes(ty)) return 'button';
+      if (ty === 'range') return 'slider';
+      if (ty === 'file') return 'file-input';
+      if (ty === 'search') return 'searchbox';
+      if (['text','email','tel','url','password','number'].includes(ty)) return 'textbox';
+      return ty + '-input';
+    }
+    if (el.isContentEditable) return 'textbox';
+    return 'clickable';
+  }
+  function nameOf(el, t) {
+    let n = T(el.getAttribute('aria-label'));
+    if (!n) { const ids = el.getAttribute('aria-labelledby');
+      if (ids) n = T(ids.split(/\s+/).map(i => { const e = el.ownerDocument.getElementById(i); return e ? (e.innerText || e.textContent) : ''; }).join(' ')); }
+    const field = t === 'input' || t === 'textarea' || t === 'select';
+    if (!n && field && el.labels && el.labels.length) n = T([...el.labels].map(l => l.innerText || l.textContent).join(' '));
+    if (!n && t === 'input' && /^(submit|button|reset)$/i.test(el.type)) n = T(el.value);
+    if (!n && t === 'input' && el.type === 'image') n = T(el.alt);
+    if (!n && field) n = T(el.placeholder);
+    if (!n && !field) n = T(el.innerText || el.textContent);
+    if (!n) n = T(el.getAttribute('title') || el.getAttribute('alt'));
+    if (!n && !field && el.querySelector) { const i = el.querySelector('img[alt],[aria-label],[title]');
+      if (i) n = T(i.getAttribute('alt') || i.getAttribute('aria-label') || i.getAttribute('title')); }
+    if (!n && field) n = T(el.getAttribute('name') || el.id);
+    if (!n && t === 'a') n = T(el.getAttribute('href'), 60);
+    return n;
+  }
+  function frameOffset(win) {
+    let x = 0, y = 0;
+    while (win && win !== W) {
+      const fe = win.frameElement; if (!fe) break;
+      const r = fe.getBoundingClientRect(), cs = fe.ownerDocument.defaultView.getComputedStyle(fe);
+      x += r.left + fe.clientLeft + parseFloat(cs.paddingLeft || 0);
+      y += r.top + fe.clientTop + parseFloat(cs.paddingTop || 0);
+      win = win.parent;
+    }
+    return { x, y };
+  }
+  function absRect(el) {
+    const r = el.getBoundingClientRect(), o = frameOffset(el.ownerDocument.defaultView);
+    return { x: r.left + o.x, y: r.top + o.y, w: r.width, h: r.height };
+  }
+  function refFor(el) {
+    let r = D.refOf.get(el);
+    if (!r) { r = 'e' + (++D.n); D.refOf.set(el, r); }
+    D.byRef.set(r, el);
+    return r;
+  }
+  function isInter(el, t, ptr, parentPtr, inside) {
+    if (t === 'a' && el.hasAttribute('href')) return true;
+    if (t === 'button' || t === 'select' || t === 'textarea' || t === 'summary') return true;
+    if (t === 'input') return (el.type || '').toLowerCase() !== 'hidden';
+    if (el.isContentEditable) return !(el.parentElement && el.parentElement.isContentEditable);
+    const role = (el.getAttribute('role') || '').trim().split(/\s+/)[0];
+    if (role && ROLES.has(role)) return true;
+    if (el.hasAttribute('onclick')) return true;
+    const ti = el.getAttribute('tabindex');
+    if (ti !== null && +ti >= 0 && t !== 'body' && t !== 'html' && t !== 'iframe') return true;
+    if (t === 'label' && el.control) return false;
+    return ptr && !parentPtr && !inside && t !== 'body' && t !== 'html';
+  }
+  function describe(el, t, r, depth) {
+    const role = roleOf(el), sk = secretKind(el), flags = [];
+    if (sk) flags.push(sk);
+    const name = nameOf(el, t);
+    let value = null;
+    if (t === 'input' || t === 'textarea') {
+      const ty = (el.type || '').toLowerCase();
+      if (ty === 'checkbox' || ty === 'radio') flags.push(el.checked ? 'checked' : 'unchecked');
+      else if (ty === 'file') value = el.files && el.files.length ? el.files.length + ' file(s)' : '';
+      else if (!['submit','button','reset','image'].includes(ty)) value = sk ? (el.value ? '[hidden]' : '') : T(el.value, 60);
+      if (el.placeholder && T(el.placeholder) !== name) flags.push('placeholder: ' + T(el.placeholder, 40));
+    } else if (t === 'select') {
+      const o = el.selectedOptions; value = T(o && o.length ? [...o].map(x => x.text).join(', ') : '', 60);
+    } else if (el.isContentEditable) value = T(el.innerText, 60);
+    const ac = el.getAttribute('aria-checked');
+    if (ac === 'true') flags.push('checked'); else if (ac === 'false') flags.push('unchecked'); else if (ac === 'mixed') flags.push('mixed');
+    const ex = el.getAttribute('aria-expanded');
+    if (ex) flags.push(ex === 'true' ? 'expanded' : 'collapsed');
+    if (el.getAttribute('aria-selected') === 'true') flags.push('selected');
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') flags.push('disabled');
+    if (el.readOnly) flags.push('read-only');
+    if (el.required) flags.push('required');
+    if (el.ownerDocument.activeElement === el) flags.push('focused');
+    if (depth > 0) flags.push('in frame');
+    const vw = W.innerWidth, vh = W.innerHeight;
+    const onScreen = r.y < vh && r.y + r.h > 0 && r.x < vw && r.x + r.w > 0;
+    const near = r.y < vh * 1.5 && r.y + r.h > -vh * 0.5;
+    if (!onScreen) flags.push('off screen');
+    return { ref: refFor(el), role, name, value, flags, near, below: r.y >= vh };
+  }
+  D.collect = () => {
+    const items = [], frames = [];
+    let count = 0;
+    const visit = (el, parentPtr, inside, depth) => {
+      if (++count > 60000) return;
+      const t = tagOf(el);
+      if (SKIP.has(t)) return;
+      const win = el.ownerDocument.defaultView;
+      const cs = win.getComputedStyle(el);
+      if (cs.display === 'none') return;
+      const ptr = cs.cursor === 'pointer';
+      const inter = isInter(el, t, ptr, parentPtr, inside);
+      if (inter) {
+        const r = absRect(el);
+        let ok = r.w > 0 && r.h > 0 && cs.visibility === 'visible', box = r;
+        if (!ok && t === 'input' && /^(checkbox|radio)$/i.test(el.type) && el.labels) {
+          const l = [...el.labels].find(l => { const q = l.getBoundingClientRect(); return q.width > 0 && q.height > 0; });
+          if (l) { ok = true; box = absRect(l); }
+        }
+        if (ok) items.push(describe(el, t, box, depth));
+      }
+      if (t === 'iframe' || t === 'frame') {
+        let doc = null; try { doc = el.contentDocument; } catch (e) {}
+        if (doc && doc.documentElement) visit(doc.documentElement, false, false, depth + 1);
+        else { const r = absRect(el);
+          if (r.w > 0 && r.h > 0) frames.push({ src: T(el.src || el.getAttribute('src') || '', 100), near: r.y < W.innerHeight * 1.5 && r.y + r.h > -W.innerHeight * 0.5 }); }
+        return;
+      }
+      if (el.shadowRoot) for (const k of el.shadowRoot.children) visit(k, ptr, inside || inter, depth);
+      for (const k of el.children) visit(k, ptr, inside || inter, depth);
+    };
+    if (document.documentElement) visit(document.documentElement, false, false, 0);
+    const se = document.scrollingElement || document.documentElement;
+    return { doc: D.doc, title: document.title, url: location.href, items, frames,
+             scrollY: Math.round(W.scrollY), scrollH: se ? se.scrollHeight : 0, vh: W.innerHeight };
+  };
+  function get(doc, ref) {
+    if (doc !== D.doc) return null;
+    const el = D.byRef.get(ref);
+    return el && el.isConnected ? el : null;
+  }
+  function usable(el) {
+    const r = el.getBoundingClientRect(), cs = el.ownerDocument.defaultView.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility === 'visible';
+  }
+  function contains(a, b) { for (let n = b; n; n = n.parentNode || n.host) if (n === a) return true; return false; }
+  function deepHit(x, y) {
+    let doc = document, ox = 0, oy = 0, h = null;
+    for (let i = 0; i < 20; i++) {
+      h = doc.elementFromPoint(x - ox, y - oy);
+      if (!h) return null;
+      while (h.shadowRoot) { const inner = h.shadowRoot.elementFromPoint(x - ox, y - oy); if (!inner || inner === h) break; h = inner; }
+      const t = tagOf(h);
+      if (t === 'iframe' || t === 'frame') {
+        let d = null; try { d = h.contentDocument; } catch (e) {}
+        if (!d) return h;
+        const o = frameOffset(d.defaultView); ox = o.x; oy = o.y; doc = d; continue;
+      }
+      return h;
+    }
+    return h;
+  }
+  function deepActive() {
+    let a = document.activeElement;
+    for (let i = 0; i < 20 && a; i++) {
+      if (a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+      else if (/^i?frame$/i.test(a.tagName)) { let d = null; try { d = a.contentDocument; } catch (e) {} if (!d || !d.activeElement) break; a = d.activeElement; }
+      else break;
+    }
+    return a;
+  }
+  D.info = (doc, ref) => {
+    const el = get(doc, ref); if (!el) return { err: 'stale' };
+    const t = tagOf(el), ty = (el.type || '').toLowerCase();
+    const textual = (t === 'input' && !['checkbox','radio','submit','button','reset','image','file','range','color','hidden'].includes(ty))
+      || t === 'textarea' || el.isContentEditable || ['textbox','searchbox','combobox','spinbutton'].includes(el.getAttribute('role') || '');
+    let checked = null;
+    if (t === 'input' && (ty === 'checkbox' || ty === 'radio')) checked = el.checked;
+    else if (['true','false','mixed'].includes(el.getAttribute('aria-checked'))) checked = el.getAttribute('aria-checked') === 'true';
+    else if (['true','false'].includes(el.getAttribute('aria-pressed'))) checked = el.getAttribute('aria-pressed') === 'true';
+    return { role: roleOf(el), name: nameOf(el, t), secret: secretKind(el), tag: t, textual, checked,
+             disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true') };
+  };
+  D.point = (doc, ref) => {
+    const el = get(doc, ref); if (!el) return { err: 'stale' };
+    let tgt = el;
+    if (!usable(el) && el.labels) { const l = [...el.labels].find(usable); if (l) tgt = l; }
+    tgt.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const r = absRect(tgt);
+    if (r.w <= 0 || r.h <= 0 || !usable(tgt)) return { err: 'invisible' };
+    const vw = W.innerWidth, vh = W.innerHeight;
+    let by = null;
+    for (const [fx, fy] of [[.5, .5], [.3, .5], [.7, .5], [.5, .3], [.5, .7], [.15, .5], [.85, .5]]) {
+      const x = r.x + r.w * fx, y = r.y + r.h * fy;
+      if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
+      const h = deepHit(x, y);
+      if (!h) continue;
+      const lab = h.closest ? h.closest('label') : null;
+      if (h === tgt || contains(tgt, h) || contains(h, tgt) || (lab && lab.control === el)) return { x, y };
+      by = by || h;
+    }
+    if (!by) return { err: 'offscreen' };
+    const bn = T(by.innerText || by.getAttribute('aria-label') || '', 40);
+    return { err: 'covered', by: tagOf(by) + (by.id ? '#' + by.id : '') + (bn ? ' "' + bn + '"' : '') };
+  };
+  D.isFocused = (doc, ref) => { const el = get(doc, ref); if (!el) return { err: 'stale' }; return { ok: deepActive() === el }; };
+  D.focus = (doc, ref) => {
+    const el = get(doc, ref); if (!el) return { err: 'stale' };
+    if (deepActive() !== el) { el.scrollIntoView({ block: 'center', behavior: 'instant' }); el.focus(); }
+    return { ok: deepActive() === el };
+  };
+  function pick(doc, ref) { return ref ? get(doc, ref) : deepActive(); }
+  function editable(el) {
+    if (!el) return false;
+    const t = tagOf(el), ty = (el.type || '').toLowerCase();
+    return (t === 'input' && !['checkbox','radio','submit','button','reset','image','file','range','color','hidden'].includes(ty))
+      || t === 'textarea' || el.isContentEditable;
+  }
+  D.active = () => { const a = deepActive();
+    return editable(a) ? { editable: true, secret: secretKind(a), name: nameOf(a, tagOf(a)) } : { editable: false }; };
+  D.caret = (doc, ref, clear) => {
+    const el = pick(doc, ref); if (!el) return { err: 'stale' };
+    const sel = el.ownerDocument.getSelection();
+    if ('value' in el && typeof el.select === 'function') {
+      if (clear) { el.select(); return { ok: true }; }
+      try { const n = el.value.length; el.setSelectionRange(n, n); return { ok: true }; } catch (e) { return { ok: false }; }
+    }
+    if (el.isContentEditable && sel) { sel.selectAllChildren(el); if (!clear) sel.collapseToEnd(); return { ok: true }; }
+    return { ok: false };
+  };
+  D.value = (doc, ref) => {
+    const el = pick(doc, ref); if (!el) return { err: 'stale' };
+    if (secretKind(el)) return { value: null };
+    if ('value' in el && tagOf(el) !== 'button') return { value: T(el.value, 80) };
+    return { value: T(el.innerText, 80) };
+  };
+  D.choose = (doc, ref, text) => {
+    const el = get(doc, ref); if (!el) return { err: 'stale' };
+    if (tagOf(el) !== 'select') return { err: 'notselect' };
+    const want = text.trim().toLowerCase(), opts = [...el.options];
+    const o = opts.find(o => T(o.text).toLowerCase() === want) || opts.find(o => o.value.toLowerCase() === want)
+      || opts.find(o => T(o.text).toLowerCase().includes(want));
+    if (!o) return { err: 'nooption', options: opts.slice(0, 30).map(o => T(o.text, 40)) };
+    if (o.disabled) return { err: 'disabledoption', chosen: T(o.text) };
+    el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    el.focus();
+    if (el.multiple) o.selected = true;
+    else { const p = el.ownerDocument.defaultView.HTMLSelectElement.prototype;
+      Object.getOwnPropertyDescriptor(p, 'value').set.call(el, o.value); }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, chosen: T(o.text) };
+  };
+  function allDocs() {
+    const out = [];
+    const walk = (doc) => { out.push(doc);
+      for (const f of doc.querySelectorAll('iframe,frame')) { let d = null; try { d = f.contentDocument; } catch (e) {} if (d && d.body) walk(d); } };
+    walk(document);
+    return out;
+  }
+  D.text = () => allDocs().map(d => d.body ? d.body.innerText : '').join('\n\n');
+  D.hasText = (s) => { s = s.toLowerCase(); return allDocs().some(d => d.body && d.body.innerText.toLowerCase().includes(s)); };
+  D.scrollTo = (where) => {
+    const se = document.scrollingElement || document.documentElement;
+    W.scrollTo({ top: where === 'top' ? 0 : se.scrollHeight, behavior: 'instant' });
+    return true;
+  };
+  D.where = () => { const se = document.scrollingElement || document.documentElement;
+    return { y: Math.round(W.scrollY), h: se.scrollHeight, vh: W.innerHeight, vw: W.innerWidth }; };
+  return D;
+})()
+"""
+
+
+# ---------------------------------------------------------------- helpers
+def http(path, method="GET"):
+    req = urllib.request.Request(f"http://{HOST}:{PORT}{path}", method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=5) as r:
+            body = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise Fail(f"Chrome refused the request ({e.code}).")
+    except (urllib.error.URLError, OSError):
+        raise Fail(f"Chrome is not reachable on {HOST}:{PORT} (no debugging port). Start Chrome from the dock, "
+                   f"or run `sudo dex-browser-enable`, then try again.")
+    try:
+        return json.loads(body)
+    except ValueError:
+        return body
+
+
+def pages():
+    return [t for t in http("/json/list") if t.get("type") == "page"
+            and not t.get("url", "").startswith(("devtools://", "chrome-extension://"))]
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE)
+
+
+def clip(s, n=90):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def norm_ref(r):
+    r = r.strip().strip("[]").lower()
+    if r.startswith("ref="):
+        r = r[4:]
+    if r.isdigit():
+        r = "e" + r
+    if not (r.startswith("e") and r[1:].isdigit()):
+        raise Fail(f"'{r}' is not a ref. Refs look like e12 (from `dex-browser snapshot`).")
+    return r
+
+
+def line_for(it):
+    s = f"{it['ref']} {it['role']}"
+    if it.get("name"):
+        s += f' "{it["name"]}"'
+    v = it.get("value")
+    if v:
+        s += " = [hidden]" if v == "[hidden]" else f' = "{v}"'
+    if it.get("flags"):
+        s += " (" + ", ".join(it["flags"]) + ")"
+    return s
+
+
+# ---------------------------------------------------------------- CDP session
+class Session:
+    def __init__(self, state):
+        self.state = state
+        self.ws = None
+        self.n = 0
+        self.events = []
+        self.tab = None
+        self.notes = []
+
+    async def __aenter__(self):
+        ps = pages()
+        if not ps:
+            http("/json/new?about:blank", "PUT")
+            ps = pages()
+        tab = next((p for p in ps if p["id"] == self.state.get("tab")), None) or ps[0]
+        if tab["id"] != self.state.get("tab"):
+            self.state.update(tab=tab["id"], doc=None, refs={})
+        await self.attach(tab)
+        return self
+
+    async def attach(self, tab):
+        if self.ws:
+            await self.ws.close()
+        import websockets
+        url = tab.get("webSocketDebuggerUrl")
+        if not url:
+            raise Fail("That tab is already being controlled by another DevTools window; close DevTools and retry.")
+        try:
+            self.ws = await asyncio.wait_for(websockets.connect(url, max_size=None, ping_interval=None), 8)
+        except Exception as e:
+            raise Fail(f"Could not connect to the tab ({type(e).__name__}: {clip(str(e), 120)}).")
+        self.tab = tab
+        self.events = []
+        try:
+            # Chrome does not answer this while a pop-up dialog opened elsewhere is showing.
+            await self.send("Page.enable", timeout=4)
+        except Timeout:
+            raise Fail("The page is not answering: a pop-up dialog (alert / confirm / leave page?) is probably "
+                       "open. Use the screenshot tool to read it and press its button.")
+
+    async def __aexit__(self, *a):
+        for n in self.notes:
+            print(n)
+        if self.ws:
+            try:
+                await asyncio.wait_for(self.ws.close(), 2)
+            except Exception:
+                pass
+
+    async def send(self, method, params=None, timeout=15):
+        self.n += 1
+        mid = self.n
+        await self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        end = time.time() + timeout
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                raise Timeout(f"Chrome did not answer in {timeout}s ({method}); the page may be frozen.")
+            try:
+                msg = json.loads(await asyncio.wait_for(self.ws.recv(), left))
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                raise Fail(f"Lost the connection to the tab ({type(e).__name__}); the tab may have closed.")
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise Fail(f"{method} failed: {msg['error'].get('message')}")
+                return msg.get("result", {})
+            m = msg.get("method")
+            if m:
+                self.events.append(msg)
+                if m == "Page.javascriptDialogOpening":
+                    await self.answer_dialog(msg.get("params", {}))
+
+    async def answer_dialog(self, p):
+        # Answer at once on this connection: a dialog left open would freeze the page for later commands.
+        kind, text = p.get("type", "dialog"), clip(p.get("message"), 160)
+        accept = kind == "alert" or ACCEPT_DIALOG is not None
+        prm = {"accept": accept}
+        if accept and kind == "prompt" and ACCEPT_DIALOG:
+            prm["promptText"] = ACCEPT_DIALOG
+        self.n += 1
+        await self.ws.send(json.dumps({"id": self.n, "method": "Page.handleJavaScriptDialog", "params": prm}))
+        if kind == "alert":
+            self.notes.append(f'the page showed an alert: "{text}" (closed with OK)')
+        elif accept:
+            self.notes.append(f'the page asked ({kind}): "{text}" -> answered OK')
+        else:
+            self.notes.append(f'the page asked ({kind}): "{text}" -> answered Cancel. '
+                              f"To answer OK, run the same command again with --accept-dialog")
+
+    async def js(self, fn, *args, timeout=15):
+        expr = f"{JS.strip()}[{json.dumps(fn)}](...{json.dumps(list(args))})"
+        r = await self.send("Runtime.evaluate", {"expression": expr, "returnByValue": True,
+                                                 "awaitPromise": True}, timeout=timeout)
+        if r.get("exceptionDetails"):
+            ex = r["exceptionDetails"]
+            raise Fail("Page script error: " + clip((ex.get("exception") or {}).get("description") or ex.get("text"), 160))
+        return (r.get("result") or {}).get("value")
+
+    async def eval(self, expr, timeout=5):
+        r = await self.send("Runtime.evaluate", {"expression": expr, "returnByValue": True}, timeout=timeout)
+        return (r.get("result") or {}).get("value")
+
+    # ---- waiting for the page
+    def _loading(self):
+        fid = self.tab["id"]
+        started = stopped = 0
+        for e in self.events:
+            p = e.get("params", {})
+            if p.get("frameId") != fid:
+                continue
+            if e["method"] == "Page.frameStartedLoading":
+                started += 1
+            elif e["method"] == "Page.frameStoppedLoading":
+                stopped += 1
+        return started > stopped
+
+    async def settle(self, first=0.4, limit=12):
+        await asyncio.sleep(first)
+        end = time.time() + limit
+        t0 = time.time()
+        while time.time() < end:
+            try:
+                rs = await self.eval("document.readyState", timeout=3)
+            except Timeout:
+                await asyncio.sleep(0.3)
+                continue
+            if not self._loading() and (rs == "complete" or (rs == "interactive" and time.time() - t0 > 3)):
+                return
+            await asyncio.sleep(0.25)
+
+    async def where(self):
+        return await self.eval("[document.title, location.href]") or ["", ""]
+
+    # ---- refs
+    async def ref(self, ref):
+        ref = norm_ref(ref)
+        if ref not in (self.state.get("refs") or {}):
+            raise Fail(f"Ref {ref} is unknown (refs come from the last `dex-browser snapshot`). Run snapshot again.")
+        info = await self.js("info", self.state.get("doc"), ref)
+        if info.get("err") == "stale":
+            raise Fail(f"Ref {ref} is stale (the page changed). Run `dex-browser snapshot` again.")
+        return ref, info
+
+    async def click_at(self, x, y, count=1):
+        base = {"x": x, "y": y, "button": "left", "buttons": 0, "pointerType": "mouse"}
+        await self.send("Input.dispatchMouseEvent", dict(base, type="mouseMoved", button="none"))
+        await asyncio.sleep(0.05)
+        for i in range(1, count + 1):
+            await self.send("Input.dispatchMouseEvent", dict(base, type="mousePressed", buttons=1, clickCount=i))
+            await asyncio.sleep(0.04)
+            await self.send("Input.dispatchMouseEvent", dict(base, type="mouseReleased", clickCount=i))
+
+    async def click_ref(self, ref, info):
+        pt = await self.js("point", self.state.get("doc"), ref)
+        err = pt.get("err")
+        what = f'{ref} {info["role"]} "{clip(info["name"], 50)}"'
+        if err == "stale":
+            raise Fail(f"Ref {ref} is stale (the page changed). Run `dex-browser snapshot` again.")
+        if err == "covered":
+            raise Fail(f"{what} is covered by {pt['by']}. Close that first (snapshot to find it), or scroll.")
+        if err == "invisible":
+            raise Fail(f"{what} is not visible on the page right now.")
+        if err == "offscreen":
+            raise Fail(f"{what} could not be scrolled into view.")
+        await asyncio.sleep(0.08)
+        await self.click_at(pt["x"], pt["y"])
+        return what
+
+    async def key(self, spec):
+        mods, key = parse_key(spec)
+        k, code, vk, text = key
+        if mods & 6:  # with Ctrl / Meta no text is typed
+            text = None
+        down = {"type": "keyDown" if text else "rawKeyDown", "key": k, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": mods}
+        if text:
+            down.update(text=text, unmodifiedText=text)
+        await self.send("Input.dispatchKeyEvent", down)
+        await self.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": k, "code": code,
+                                                   "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+                                                   "modifiers": mods})
+
+
+NAMED_KEYS = {
+    "enter": ("Enter", "Enter", 13, "\r"), "return": ("Enter", "Enter", 13, "\r"),
+    "tab": ("Tab", "Tab", 9, None), "escape": ("Escape", "Escape", 27, None), "esc": ("Escape", "Escape", 27, None),
+    "backspace": ("Backspace", "Backspace", 8, None), "delete": ("Delete", "Delete", 46, None),
+    "arrowup": ("ArrowUp", "ArrowUp", 38, None), "arrowdown": ("ArrowDown", "ArrowDown", 40, None),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37, None), "arrowright": ("ArrowRight", "ArrowRight", 39, None),
+    "up": ("ArrowUp", "ArrowUp", 38, None), "down": ("ArrowDown", "ArrowDown", 40, None),
+    "left": ("ArrowLeft", "ArrowLeft", 37, None), "right": ("ArrowRight", "ArrowRight", 39, None),
+    "home": ("Home", "Home", 36, None), "end": ("End", "End", 35, None),
+    "pageup": ("PageUp", "PageUp", 33, None), "pagedown": ("PageDown", "PageDown", 34, None),
+    "space": (" ", "Space", 32, " "),
+}
+MODS = {"alt": 1, "option": 1, "ctrl": 2, "control": 2, "meta": 4, "cmd": 4, "command": 4, "shift": 8}
+
+
+def parse_key(spec):
+    parts = [p for p in spec.replace(" ", "").split("+") if p] or [spec]
+    mods = 0
+    for p in parts[:-1]:
+        if p.lower() not in MODS:
+            raise Fail(f"Unknown modifier '{p}'. Use Ctrl, Shift, Alt or Meta, like Ctrl+A.")
+        mods |= MODS[p.lower()]
+    last = parts[-1]
+    if last.lower() in NAMED_KEYS:
+        return mods, NAMED_KEYS[last.lower()]
+    if len(last) == 1:
+        c = last
+        code = ("Key" + c.upper()) if c.isalpha() else ("Digit" + c) if c.isdigit() else ""
+        if mods & 8 and c.isalpha():
+            c = c.upper()
+        return mods, (c, code, ord(c.upper()) if c.isalnum() else ord(c), c)
+    m = __import__("re").fullmatch(r"[fF]([1-9]|1[0-2])", last)
+    if m:
+        n = int(m.group(1))
+        return mods, (f"F{n}", f"F{n}", 111 + n, None)
+    raise Fail(f"Unknown key '{last}'. Try Enter, Tab, Escape, Backspace, ArrowDown, PageDown, Space, or Ctrl+A.")
+
+
+# ---------------------------------------------------------------- commands
+async def cmd_tabs(st, args):
+    ps = pages()
+    cur = st.get("tab")
+    if not any(p["id"] == cur for p in ps) and ps:
+        cur = ps[0]["id"]
+    st["tabs"] = [p["id"] for p in ps]
+    for i, p in enumerate(ps):
+        mark = "*" if p["id"] == cur else " "
+        print(f"{mark} {i}  {clip(p.get('title') or '(no title)', 60)}  {clip(p.get('url'), 100)}")
+    if not ps:
+        print("no tabs open")
+    print("(* = the tab dex-browser works in; `dex-browser tab <index>` to switch)")
+
+
+def fix_url(u):
+    if "://" in u or u.startswith(("about:", "data:", "file:", "chrome:")):
+        return u
+    return "https://" + u
+
+
+async def show_page(s, prefix="page"):
+    t, u = await s.where()
+    print(f"{prefix}: {clip(t, 80) or '(no title)'} | {u}")
+
+
+async def cmd_open(st, args):
+    new = "--new-tab" in args
+    rest = [a for a in args if a != "--new-tab"]
+    if not rest:
+        raise Fail("Usage: dex-browser open <url> [--new-tab]")
+    url = fix_url(rest[0])
+    if new:
+        from urllib.parse import quote
+        tab = http("/json/new?" + quote(url, safe=":/?&=%#+@,;~"), "PUT")
+        if not isinstance(tab, dict) or "id" not in tab:
+            raise Fail("Chrome did not open a new tab.")
+        http(f"/json/activate/{tab['id']}")
+        st.update(tab=tab["id"], doc=None, refs={})
+        async with Session(st) as s:
+            await s.settle(0.6)
+            await show_page(s, "opened in new tab")
+        return
+    async with Session(st) as s:
+        http(f"/json/activate/{s.tab['id']}")
+        r = await s.send("Page.navigate", {"url": url}, timeout=30)
+        if r.get("errorText"):
+            raise Fail(f"Could not open {url}: {r['errorText']}")
+        await s.settle(0.5, limit=20)
+        st.update(doc=None, refs={})
+        await show_page(s, "opened")
+
+
+async def cmd_tab(st, args):
+    if not args or not args[0].isdigit():
+        raise Fail("Usage: dex-browser tab <index>  (see `dex-browser tabs`)")
+    i = int(args[0])
+    ps = pages()
+    ids = st.get("tabs") or [p["id"] for p in ps]
+    if i >= len(ids):
+        raise Fail(f"There is no tab {i}. Run `dex-browser tabs`.")
+    tab = next((p for p in ps if p["id"] == ids[i]), None)
+    if not tab:
+        raise Fail(f"Tab {i} was closed. Run `dex-browser tabs` again.")
+    http(f"/json/activate/{tab['id']}")
+    st.update(tab=tab["id"], doc=None, refs={})
+    print(f"now in tab {i}: {clip(tab.get('title'), 80)} | {tab.get('url')}")
+
+
+async def cmd_back(st, args):
+    async with Session(st) as s:
+        h = await s.send("Page.getNavigationHistory")
+        i = h.get("currentIndex", 0)
+        if i <= 0:
+            raise Fail("There is no earlier page in this tab.")
+        await s.send("Page.navigateToHistoryEntry", {"entryId": h["entries"][i - 1]["id"]})
+        await s.settle(0.5)
+        st.update(doc=None, refs={})
+        await show_page(s, "back to")
+
+
+async def cmd_reload(st, args):
+    async with Session(st) as s:
+        await s.send("Page.reload")
+        await s.settle(0.5, limit=20)
+        st.update(doc=None, refs={})
+        await show_page(s, "reloaded")
+
+
+async def snap(s, st):
+    data = await s.js("collect", timeout=30)
+    if data["doc"] != st.get("doc"):
+        st["refs"] = {}
+    st["doc"] = data["doc"]
+    st["url"] = data["url"]
+    refs = st.setdefault("refs", {})
+    for it in data["items"]:
+        refs[it["ref"]] = f'{it["role"]} {clip(it["name"], 40)}'
+    return data
+
+
+async def cmd_snapshot(st, args):
+    show_all = "--all" in args
+    async with Session(st) as s:
+        d = await snap(s, st)
+    print(f"page: {clip(d['title'], 100) or '(no title)'}")
+    print(f"url: {d['url']}")
+    screens = d["scrollH"] / d["vh"] if d["vh"] else 1
+    if screens > 1.05:
+        pct = round(100 * d["scrollY"] / max(1, d["scrollH"] - d["vh"]))
+        print(f"scroll: {min(100, max(0, pct))}% down (page is {screens:.1f} screens tall)")
+    items = d["items"] if show_all else [i for i in d["items"] if i["near"]]
+    hidden = len(d["items"]) - len(items)
+    cut = 0
+    if not show_all and len(items) > SNAPSHOT_CAP:
+        cut = len(items) - SNAPSHOT_CAP
+        items = items[:SNAPSHOT_CAP]
+    for it in items:
+        print(line_for(it))
+    if not d["items"]:
+        print("(no clickable or typeable elements found)")
+    for f in d["frames"]:
+        if show_all or f["near"]:
+            print(f"frame: cross-origin frame {clip(f['src'], 80) or '(no address)'} cannot be read; "
+                  f"use the screenshot tool for what is inside it")
+    if cut or hidden:
+        print(f"({cut + hidden} more elements further up/down the page: scroll, "
+              f"use `find <words>`, or `snapshot --all`)")
+
+
+async def cmd_find(st, args):
+    words = [w.lower() for w in " ".join(args).split()]
+    if not words:
+        raise Fail("Usage: dex-browser find <words>")
+    async with Session(st) as s:
+        d = await snap(s, st)
+    hits = [it for it in d["items"]
+            if all(w in " ".join([it["name"] or "", it["value"] or "", it["role"], *it["flags"]]).lower() for w in words)]
+    for it in hits[:40]:
+        print(line_for(it))
+    if len(hits) > 40:
+        print(f"({len(hits) - 40} more matches; use more words)")
+    if not hits:
+        print(f"no element matches \"{' '.join(words)}\" (try `dex-browser text` or a shorter word)")
+
+
+async def cmd_click(st, args):
+    if not args:
+        raise Fail("Usage: dex-browser click <ref>")
+    async with Session(st) as s:
+        ref, info = await s.ref(args[0])
+        before_tabs = {p["id"] for p in pages()}
+        t0, u0 = await s.where()
+        what = await s.click_ref(ref, info)
+        print(f"clicked {what}" + (" (it looks disabled)" if info.get("disabled") else ""))
+        await s.settle(0.5)
+        new = [p for p in pages() if p["id"] not in before_tabs]
+        if new:
+            st.update(tab=new[0]["id"], doc=None, refs={})
+            print(f"a new tab opened and is now selected: {clip(new[0].get('title'), 60)} | {new[0].get('url')}")
+            return
+        t1, u1 = await s.where()
+        if u1 != u0:
+            print(f"page changed: {clip(t1, 80)} | {u1}")
+
+
+def refuse_secret(ref, info):
+    kind = info["secret"]
+    if kind == "card number":
+        raise Fail(f"{ref} is a card number field: dex-browser will not type into it. "
+                   f"Run `dex-browser focus {ref}` and ask the person to type it.")
+    tool = "enter_code" if kind == "one-time code" else "fill_password"
+    raise Fail(f"{ref} is a {kind} field: dex-browser will not type into it. Run `dex-browser focus {ref}`, "
+               f"then use your {tool} tool.")
+
+
+async def cmd_type(st, args):
+    clear = "--clear" in args
+    enter = "--enter" in args
+    rest = [a for a in args if a not in ("--clear", "--enter")]
+    if len(rest) < 2 and not (len(rest) == 1 and clear):
+        raise Fail("Usage: dex-browser type <ref> <text> [--clear] [--enter]")
+    text = " ".join(rest[1:])
+    async with Session(st) as s:
+        ref, info = await s.ref(rest[0])
+        if info["secret"]:
+            refuse_secret(ref, info)
+        if not info["textual"]:
+            raise Fail(f'{ref} is a {info["role"]}, not a text field. Use click, select or check instead.')
+        if info.get("disabled"):
+            raise Fail(f"{ref} is disabled.")
+        target = ref
+        foc = await s.js("isFocused", st.get("doc"), ref)
+        if not foc.get("ok"):
+            try:
+                await s.click_ref(ref, info)
+                await asyncio.sleep(0.2)
+            except Fail as e:
+                if "covered" in str(e):
+                    raise
+            foc = await s.js("focus", st.get("doc"), ref)
+            if not foc.get("ok"):
+                # Some sites swap the field for a new one when it is clicked: use the field that has the cursor.
+                act = await s.js("active")
+                if not act.get("editable"):
+                    raise Fail(f"Could not put the cursor in {ref}; click it first, then try again.")
+                if act.get("secret"):
+                    refuse_secret(ref, dict(info, secret=act["secret"]))
+                target = None
+        c = await s.js("caret", st.get("doc"), target, clear)
+        if not c.get("ok"):
+            await s.key("Ctrl+A" if clear else "End")
+        if clear and not text:
+            await s.key("Backspace")
+        if text:
+            await s.send("Input.insertText", {"text": text})
+        v = await s.js("value", st.get("doc"), target)
+        shown = "" if v.get("value") is None else f' (now "{clip(v["value"], 60)}")'
+        print(f'typed into {ref} {info["role"]} "{clip(info["name"], 50)}"{shown}')
+        if enter:
+            t0, u0 = await s.where()
+            await s.key("Enter")
+            await s.settle(0.6)
+            t1, u1 = await s.where()
+            print("pressed Enter" + (f"; page changed: {clip(t1, 80)} | {u1}" if u1 != u0 else ""))
+
+
+async def cmd_focus(st, args):
+    if not args:
+        raise Fail("Usage: dex-browser focus <ref>")
+    async with Session(st) as s:
+        ref, info = await s.ref(args[0])
+        try:
+            await s.click_ref(ref, info)
+            await asyncio.sleep(0.15)
+        except Fail as e:
+            if "covered" in str(e):
+                raise
+        r = await s.js("focus", st.get("doc"), ref)
+        if not r.get("ok"):
+            act = await s.js("active")  # the site may have swapped the field for a new one
+            if not act.get("editable"):
+                raise Fail(f"Could not put the cursor in {ref}.")
+            info = dict(info, secret=act.get("secret") or info["secret"])
+        msg = f'focused {ref} {info["role"]} "{clip(info["name"], 50)}"'
+        if info["secret"] == "password":
+            msg += ". Now use your fill_password tool."
+        elif info["secret"] == "one-time code":
+            msg += ". Now use your enter_code tool."
+        elif info["secret"]:
+            msg += ". Ask the person to type it."
+        print(msg)
+
+
+async def cmd_select(st, args):
+    if len(args) < 2:
+        raise Fail("Usage: dex-browser select <ref> <option text>")
+    async with Session(st) as s:
+        ref, info = await s.ref(args[0])
+        r = await s.js("choose", st.get("doc"), ref, " ".join(args[1:]))
+        if r.get("err") == "notselect":
+            raise Fail(f"{ref} is not a plain list box. Click it, run snapshot, then click the option you want.")
+        if r.get("err") == "nooption":
+            raise Fail(f"No option like that in {ref}. Options: " + "; ".join(r["options"]))
+        if r.get("err") == "disabledoption":
+            raise Fail(f'The option "{r["chosen"]}" is disabled.')
+        if r.get("err"):
+            raise Fail(f"Ref {ref} is stale. Run `dex-browser snapshot` again.")
+        await s.settle(0.3)
+        print(f'selected "{r["chosen"]}" in {ref} {info["role"]} "{clip(info["name"], 50)}"')
+
+
+async def cmd_check(st, args):
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        raise Fail("Usage: dex-browser check <ref> on|off")
+    want = args[1].lower() == "on"
+    async with Session(st) as s:
+        ref, info = await s.ref(args[0])
+        if info["checked"] is None:
+            raise Fail(f'{ref} {info["role"]} has no on/off state. Use click instead.')
+        if info["checked"] == want:
+            print(f"{ref} is already {args[1].lower()}")
+            return
+        what = await s.click_ref(ref, info)
+        await s.settle(0.3)
+        _, info2 = await s.ref(ref)
+        if info2["checked"] != want:
+            raise Fail(f"Clicked {what} but it is still {'on' if info2['checked'] else 'off'}.")
+        print(f"{what} is now {args[1].lower()}")
+
+
+async def cmd_key(st, args):
+    if not args:
+        raise Fail("Usage: dex-browser key <Enter|Tab|Escape|ArrowDown|Ctrl+A|...> [times]")
+    times = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
+    parse_key(args[0])
+    async with Session(st) as s:
+        t0, u0 = await s.where()
+        for _ in range(min(times, 50)):
+            await s.key(args[0])
+            await asyncio.sleep(0.05)
+        await s.settle(0.3)
+        t1, u1 = await s.where()
+        print(f"pressed {args[0]}" + (f" x{times}" if times > 1 else "")
+              + (f"; page changed: {clip(t1, 80)} | {u1}" if u1 != u0 else ""))
+
+
+async def cmd_scroll(st, args):
+    where = (args[0].lower() if args else "down")
+    if where not in ("up", "down", "top", "bottom"):
+        raise Fail("Usage: dex-browser scroll up|down|top|bottom")
+    async with Session(st) as s:
+        w = await s.js("where")
+        x, y = w["vw"] / 2, w["vh"] / 2
+        step = round(w["vh"] * 0.8)
+        if where in ("top", "bottom"):
+            await s.js("scrollTo", where)
+            dy = (-1 if where == "top" else 1) * step * 5
+        else:
+            dy = (1 if where == "down" else -1) * step
+        w1 = await s.js("where")
+        if where in ("up", "down") or w1["y"] == w["y"]:
+            # A real wheel turn over the middle of the page (it also scrolls inner panels).
+            try:
+                await s.send("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y,
+                                                          "deltaX": 0, "deltaY": dy}, timeout=2)
+            except Timeout:
+                pass  # Chrome answers wheel events late when the tab is not painting; the scroll still happens.
+            await asyncio.sleep(0.4)
+        w2 = await s.js("where")
+        if where in ("up", "down") and w2["y"] == w["y"]:
+            await s.eval(f"window.scrollBy(0, {dy})")
+            w2 = await s.js("where")
+        span = max(1, w2["h"] - w2["vh"])
+        pct = min(100, max(0, round(100 * w2["y"] / span)))
+        moved = "" if w2["y"] != w["y"] else " (the page itself did not move; it may be at the end, or an inner panel scrolled)"
+        print(f"scrolled {where}; now {pct}% down the page{moved}")
+
+
+async def cmd_text(st, args):
+    mx = 6000
+    if "--max" in args:
+        try:
+            mx = int(args[args.index("--max") + 1])
+        except (IndexError, ValueError):
+            raise Fail("Usage: dex-browser text [--max N]")
+    async with Session(st) as s:
+        t, u = await s.where()
+        txt = await s.js("text", timeout=20) or ""
+    lines, blank = [], 0
+    for ln in txt.splitlines():
+        ln = ln.rstrip()
+        if not ln.strip():
+            blank += 1
+            if blank > 1:
+                continue
+        else:
+            blank = 0
+        lines.append(ln)
+    out = "\n".join(lines).strip()
+    print(f"page: {clip(t, 100)} | {u}")
+    if len(out) > mx:
+        print(out[:mx])
+        print(f"... ({len(out) - mx} more characters; use --max {len(out)} or scroll + snapshot)")
+    else:
+        print(out or "(the page has no text)")
+
+
+async def cmd_wait(st, args):
+    if args and args[0] == "--for":
+        if len(args) < 2:
+            raise Fail("Usage: dex-browser wait --for <text> [--timeout N]")
+        limit = 20.0
+        a = args[1:]
+        if "--timeout" in a:
+            i = a.index("--timeout")
+            try:
+                limit = float(a[i + 1])
+            except (IndexError, ValueError):
+                raise Fail("Usage: dex-browser wait --for <text> [--timeout N]")
+            a = a[:i] + a[i + 2:]
+        want = " ".join(a)
+        end = time.time() + limit
+        async with Session(st) as s:
+            while time.time() < end:
+                try:
+                    if await s.js("hasText", want, timeout=5):
+                        print(f'found "{want}"')
+                        return
+                except Timeout:
+                    pass
+                await asyncio.sleep(0.5)
+        raise Fail(f'"{want}" did not appear within {limit:g}s.')
+    if args:
+        try:
+            n = float(args[0])
+        except ValueError:
+            raise Fail("Usage: dex-browser wait [seconds | --for <text>]")
+        await asyncio.sleep(max(0, min(n, 120)))
+        print(f"waited {n:g}s")
+        return
+    async with Session(st) as s:
+        await s.settle(0.2, limit=20)
+        await show_page(s, "ready")
+
+
+async def cmd_screenshot(st, args):
+    if not args:
+        raise Fail("Usage: dex-browser screenshot <file.png>")
+    path = os.path.abspath(os.path.expanduser(args[0]))
+    async with Session(st) as s:
+        r = await s.send("Page.captureScreenshot", {"format": "png"}, timeout=30)
+    data = base64.b64decode(r["data"])
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    print(f"saved {path} ({len(data) // 1024} KB)")
+
+
+COMMANDS = {
+    "tabs": cmd_tabs, "open": cmd_open, "tab": cmd_tab, "back": cmd_back, "reload": cmd_reload,
+    "snapshot": cmd_snapshot, "click": cmd_click, "type": cmd_type, "select": cmd_select,
+    "check": cmd_check, "key": cmd_key, "scroll": cmd_scroll, "focus": cmd_focus, "text": cmd_text,
+    "find": cmd_find, "wait": cmd_wait, "screenshot": cmd_screenshot,
+}
+
+
+def main():
+    global ACCEPT_DIALOG
+    argv = []
+    for a in sys.argv[1:]:
+        if a == "--accept-dialog" or a.startswith("--accept-dialog="):
+            ACCEPT_DIALOG = a.partition("=")[2]
+        else:
+            argv.append(a)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    fn = COMMANDS.get(argv[0])
+    if not fn:
+        print(f"error: unknown command '{argv[0]}'. Run `dex-browser help`.")
+        return 2
+    st = load_state()
+    try:
+        asyncio.run(fn(st, argv[1:]))
+        return 0
+    except Fail as e:
+        print(f"error: {e}")
+        return 1
+    except ImportError:
+        print("error: the Python package 'websockets' is missing (apt install python3-websockets).")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:  # never show a traceback to the agent
+        print(f"error: {type(e).__name__}: {clip(str(e), 200)}")
+        return 1
+    finally:
+        try:
+            save_state(st)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

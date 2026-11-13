@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Turns on dex-browser in an ALREADY RUNNING bot desktop. Run as root, with dex-browser
+# (and BROWSER.md) in the same folder as this script:
+#   docker cp dex-browser dex-browser-enable BROWSER.md <container>:/tmp/
+#   docker exec -u 0 <container> /tmp/dex-browser-enable
+# It installs the tool, adds the DevTools flags to every Chrome launcher, moves the old
+# profile to ~/.config/dex-chrome once (keeping sign-ins), and restarts Chrome with the
+# same tabs if it runs without the port. Safe to run again. Last line: OK ... or why not.
+set -u
+USER_NAME=kasm-user
+PORT=9222
+NEW_DIR_NAME=.config/dex-chrome
+FLAGS="--remote-debugging-port=$PORT --remote-debugging-address=127.0.0.1 --user-data-dir=/home/$USER_NAME/$NEW_DIR_NAME"
+CHROME_BIN=/usr/bin/google-chrome-stable
+
+fail() { echo "FAILED: $*"; exit 1; }
+[ "$(id -u)" = 0 ] || fail "run this as root (docker exec -u 0 ...)"
+HOME_DIR=$(getent passwd "$USER_NAME" | cut -d: -f6)
+[ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || fail "user $USER_NAME or its home folder is missing"
+UID_N=$(id -u "$USER_NAME"); GID_N=$(id -g "$USER_NAME")
+HERE=$(cd "$(dirname "$0")" && pwd)
+OLD_DIR="$HOME_DIR/.config/google-chrome"
+NEW_DIR="$HOME_DIR/$NEW_DIR_NAME"
+
+port_ready() { curl -s --noproxy '*' -m 2 "http://127.0.0.1:$PORT/json/version" 2>/dev/null | grep -q '"Browser"'; }
+# The main Chrome process of the user (helpers have --type=...).
+chrome_main_pids() {
+  for p in $(pgrep -u "$UID_N" -f '/opt/google/chrome/chrome' 2>/dev/null); do
+    tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- '--type=' || echo "$p"
+  done
+}
+
+# (a) install the tool and its guide
+if [ -f "$HERE/dex-browser" ]; then
+  if [ "$HERE/dex-browser" != /usr/local/bin/dex-browser ]; then
+    install -m 755 "$HERE/dex-browser" /usr/local/bin/dex-browser || fail "could not install dex-browser"
+  fi
+elif [ ! -x /usr/local/bin/dex-browser ]; then
+  fail "dex-browser is not next to this script ($HERE); copy it there first"
+fi
+if [ -f "$HERE/BROWSER.md" ] && [ "$HERE" != /usr/local/share/dexbot ]; then
+  install -D -m 644 "$HERE/BROWSER.md" /usr/local/share/dexbot/BROWSER.md
+fi
+[ "$HERE/dex-browser-enable" = /usr/local/bin/dex-browser-enable ] || install -m 755 "$HERE/dex-browser-enable" /usr/local/bin/dex-browser-enable
+python3 -c 'import websockets' 2>/dev/null || echo "warning: python3 websockets is missing (apt install python3-websockets)"
+echo "installed /usr/local/bin/dex-browser"
+
+# (b) add the flags to every Chrome launcher (only where they are not there yet)
+patch_launcher() {
+  local f=$1
+  grep -q '^Exec=.*google-chrome' "$f" 2>/dev/null || return 0
+  grep -q -- '--remote-debugging-port' "$f" && return 0
+  sed -i -E "/^Exec=/s#(google-chrome(-stable)?)( |\$)#\\1 $FLAGS\\3#" "$f" && echo "patched $f"
+}
+for f in /usr/share/applications/*.desktop \
+         /home/kasm-default-profile/.config/xfce4/panel/launcher-*/*.desktop \
+         "$HOME_DIR"/.config/xfce4/panel/launcher-*/*.desktop \
+         "$HOME_DIR"/.local/share/applications/*.desktop \
+         "$HOME_DIR"/Desktop/*.desktop; do
+  [ -f "$f" ] && patch_launcher "$f"
+done
+# The start-up script clears Chrome's stale lock: make it clear the new folder too.
+S=/dockerstartup/custom_startup.sh
+if [ -f "$S" ] && ! grep -q dex-chrome "$S"; then
+  sed -i 's#^rm -f "$HOME/.config/google-chrome/Singleton"\*#rm -f "$HOME/.config/dex-chrome/Singleton"* "$HOME/.config/google-chrome/Singleton"*#' "$S" \
+    && grep -q dex-chrome "$S" && echo "patched $S"
+fi
+
+if port_ready; then
+  [ -d "$NEW_DIR" ] || echo "warning: the port answers but $NEW_DIR does not exist"
+  echo "OK debugging port ready"; exit 0
+fi
+
+# (d, first half) remember the desktop session of the running Chrome, then close it gently.
+DISPLAY_V=:1; XAUTH_V=""; DBUS_V=""; XDG_V="/run/user/$UID_N"
+PIDS=$(chrome_main_pids)
+WAS_RUNNING=no
+if [ -n "$PIDS" ]; then
+  WAS_RUNNING=yes
+  P1=$(echo "$PIDS" | head -n1)
+  envv() { tr '\0' '\n' <"/proc/$P1/environ" 2>/dev/null | sed -n "s/^$1=//p" | head -n1; }
+  DISPLAY_V=$(envv DISPLAY); DISPLAY_V=${DISPLAY_V:-:1}
+  XAUTH_V=$(envv XAUTHORITY); DBUS_V=$(envv DBUS_SESSION_BUS_ADDRESS)
+  X=$(envv XDG_RUNTIME_DIR); [ -n "$X" ] && XDG_V=$X
+  echo "closing Chrome (pid $P1) to restart it with the debugging port"
+  kill -TERM $PIDS 2>/dev/null
+  for _ in $(seq 1 30); do [ -z "$(chrome_main_pids)" ] && break; sleep 0.5; done
+  if [ -n "$(chrome_main_pids)" ]; then
+    kill -KILL $(chrome_main_pids) 2>/dev/null; sleep 1
+  fi
+  [ -z "$(chrome_main_pids)" ] || fail "Chrome did not close; close it by hand and run this again"
+else
+  # Not running: take the desktop session from the user's other desktop programs.
+  for prog in xfce4-panel xfdesktop xfce4-session; do
+    P1=$(pgrep -u "$UID_N" -x "$prog" | head -n1)
+    [ -n "$P1" ] || continue
+    envv() { tr '\0' '\n' <"/proc/$P1/environ" 2>/dev/null | sed -n "s/^$1=//p" | head -n1; }
+    D=$(envv DISPLAY); [ -n "$D" ] && DISPLAY_V=$D
+    XAUTH_V=$(envv XAUTHORITY); DBUS_V=$(envv DBUS_SESSION_BUS_ADDRESS)
+    break
+  done
+fi
+
+# (c) move the old profile once (sign-ins, tabs, history), keeping its owner.
+if [ -d "$OLD_DIR" ] && [ ! -e "$NEW_DIR" ]; then
+  mv "$OLD_DIR" "$NEW_DIR" || fail "could not move $OLD_DIR to $NEW_DIR"
+  echo "moved the Chrome profile to $NEW_DIR"
+elif [ -d "$OLD_DIR" ] && [ -d "$NEW_DIR" ]; then
+  echo "note: both $OLD_DIR and $NEW_DIR exist; using $NEW_DIR"
+fi
+mkdir -p "$NEW_DIR" && chown "$UID_N:$GID_N" "$HOME_DIR/.config" "$NEW_DIR"
+# Anything that still starts Chrome the old way (no flags) must land in the same profile, not
+# in a fresh empty one: the old default path becomes a link to the new folder.
+if [ ! -e "$OLD_DIR" ] && [ ! -L "$OLD_DIR" ]; then
+  ln -s "$NEW_DIR" "$OLD_DIR" && chown -h "$UID_N:$GID_N" "$OLD_DIR" && echo "linked $OLD_DIR to the new profile"
+fi
+rm -f "$NEW_DIR"/Singleton* 2>/dev/null
+
+# (d) start Chrome for the user on its desktop, restoring the last tabs.
+[ -x "$CHROME_BIN" ] || fail "$CHROME_BIN is missing"
+ENVV=(HOME="$HOME_DIR" USER="$USER_NAME" LOGNAME="$USER_NAME" DISPLAY="$DISPLAY_V" XDG_RUNTIME_DIR="$XDG_V"
+      PATH=/usr/local/bin:/usr/bin:/bin LANG="${LANG:-en_US.UTF-8}")
+[ -n "$XAUTH_V" ] && ENVV+=(XAUTHORITY="$XAUTH_V")
+[ -n "$DBUS_V" ] && ENVV+=(DBUS_SESSION_BUS_ADDRESS="$DBUS_V")
+# shellcheck disable=SC2086
+setsid sudo -u "$USER_NAME" env -i "${ENVV[@]}" "$CHROME_BIN" --no-sandbox --test-type --no-first-run \
+  --password-store=basic --start-maximized --lang=en-US $FLAGS --restore-last-session \
+  >/tmp/dex-chrome-start.log 2>&1 </dev/null &
+disown 2>/dev/null
+echo "started Chrome for $USER_NAME on display $DISPLAY_V (it was running: $WAS_RUNNING)"
+
+for _ in $(seq 1 40); do
+  if port_ready; then echo "OK debugging port ready"; exit 0; fi
+  sleep 0.5
+done
+fail "Chrome started but port $PORT does not answer (see /tmp/dex-chrome-start.log)"

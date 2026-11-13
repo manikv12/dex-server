@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""dex-site: publishes a web page or small web app you built for the person.
+
+    dex-site new <folder> "Title"    start from the Dex design kit (React, charts, icons, the house look)
+    dex-site <folder> "Title"        publish it (again: updates the same site)
+
+The folder must be inside your home folder and hold index.html (plain HTML, CSS, JavaScript and files: a
+built static site, not a server). The person sees a card in your chat and opens it in the Dex app. It stays
+private unless they share its link. Running it again with the same folder updates the same site (same link).
+"""
+import json, os, shutil, socket, sys
+
+SOCK = os.path.expanduser("~/.dex/files.sock")
+STARTER = "/usr/local/share/dex-site-starter"
+
+
+def new(folder, title):
+    folder = os.path.expanduser(folder)
+    if os.path.exists(folder) and os.listdir(folder):
+        print("Not made: that folder isn't empty")
+        return 1
+    if not os.path.isdir(STARTER):
+        print("Not made: the starter isn't on this computer yet. Try again in a minute.")
+        return 1
+    shutil.copytree(STARTER, folder, dirs_exist_ok=True)
+    title = title or "My site"
+    for name in ("index.html", "app.js"):
+        path = os.path.join(folder, name)
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(text.replace("Site title", title.replace('"', "'")).replace("Page title", title.replace('"', "'")))
+    print(f"Made {folder} from the starter. Read its DESIGN.md first. Then put the real data in app.js (DATA) and keep the sections that fit, "
+          f"add a square favicon.png if the site has a logo (otherwise Dex draws one), then run: dex-site {folder} \"{title}\"")
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 1
+    if sys.argv[1] == "new":
+        if len(sys.argv) < 3:
+            print('Usage: dex-site new <folder> "Title"')
+            return 1
+        return new(sys.argv[2], " ".join(sys.argv[3:]))
+    home = os.path.realpath(os.path.expanduser("~"))
+    folder = os.path.realpath(os.path.expanduser(sys.argv[1]))
+    title = " ".join(sys.argv[2:])
+    if not os.path.isdir(folder):
+        print("Not published: no such folder")
+        return 1
+    if os.path.commonpath([home, folder]) != home or folder == home:
+        print("Not published: put the site in a folder inside your home folder first (for example ~/Sites/my-site)")
+        return 1
+    if not os.path.isfile(os.path.join(folder, "index.html")):
+        print("Not published: the folder has no index.html (the site's first page)")
+        return 1
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(300)
+        s.connect(SOCK)
+        s.sendall(json.dumps({"op": "publish", "path": os.path.relpath(folder, home), "title": title}).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            data = s.recv(65536)
+            if not data:
+                break
+            buf += data
+        s.close()
+        reply = json.loads(buf.split(b"\n")[0])
+    except (OSError, ValueError):
+        print("Not published: Dex could not be reached. Try again in a minute.")
+        return 1
+    print(reply.get("text") or ("Published." if reply.get("ok") else "Not published."))
+    return 0 if reply.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

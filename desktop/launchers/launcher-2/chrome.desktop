@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Google Chrome
+Exec=/usr/bin/google-chrome-stable --no-sandbox --test-type --no-first-run --password-store=basic --start-maximized --lang=en-US --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=/home/kasm-user/.config/dex-chrome %U
+Icon=google-chrome
+Terminal=false

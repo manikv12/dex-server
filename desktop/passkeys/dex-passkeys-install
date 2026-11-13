@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Puts the Dex Passkeys extension and its helper into the bots' computers. Run as root on the server:
+#   dex-passkeys-install            every running bot computer
+#   dex-passkeys-install <slug>...  only these
+# Chrome installs the extension by policy from a file inside the bot's computer (no network), and
+# nothing in a page can switch it off. The extension's signing key stays on this server
+# (/etc/dexbot/passkeys-ext.pem). Safe to run again. One line per computer: "ok <slug>" or why not.
+set -u
+SRC=/usr/local/share/dexbot/passkeys-src            # extension/, pack.py, dex-passkeys-host (from setup-hub.sh)
+OUT=/usr/local/share/dexbot/passkeys                # the packed files, the same path inside a bot's computer
+KEY=/etc/dexbot/passkeys-ext.pem
+[ "$(id -u)" = 0 ] || { echo "run this as root"; exit 1; }
+[ -d "$SRC/extension" ] || { echo "missing $SRC (run setup-hub.sh)"; exit 1; }
+install -d -m 755 "$OUT"
+ID=$(python3 "$SRC/pack.py" "$SRC/extension" "$KEY" "$OUT" "$OUT" | cut -d' ' -f1) || { echo "packing failed"; exit 1; }
+[ ${#ID} = 32 ] || { echo "packing failed"; exit 1; }
+install -m 755 "$SRC/dex-passkeys-host" "$OUT/dex-passkeys-host"
+cat > "$OUT/ai.dex.passkeys.json" <<J
+{"name": "ai.dex.passkeys", "description": "Dex Passkeys helper", "path": "/usr/local/bin/dex-passkeys-host", "type": "stdio", "allowed_origins": ["chrome-extension://$ID/"]}
+J
+cat > "$OUT/policy.json" <<J
+{"ExtensionInstallForcelist": ["$ID;file://$OUT/updates.xml"]}
+J
+chmod 644 "$OUT"/*.json "$OUT"/*.xml "$OUT"/*.crx
+
+# Chrome reads new policy files only now and then: ask a running Chrome to read them now.
+RELOAD='
+import asyncio, json, urllib.request, websockets
+async def main():
+    o = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    v = json.load(o.open("http://127.0.0.1:9222/json/version", timeout=3))
+    async with websockets.connect(v["webSocketDebuggerUrl"], max_size=2**22) as ws:
+        n = 0
+        async def call(method, params=None, session=None):
+            nonlocal n
+            n += 1
+            m = {"id": n, "method": method, "params": params or {}}
+            if session: m["sessionId"] = session
+            await ws.send(json.dumps(m))
+            while True:
+                r = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                if r.get("id") == n: return r.get("result") or {}
+        t = (await call("Target.createTarget", {"url": "chrome://policy", "background": True}))["targetId"]
+        s = (await call("Target.attachToTarget", {"targetId": t, "flatten": True}))["sessionId"]
+        await asyncio.sleep(1.5)
+        await call("Runtime.evaluate", {"expression": "chrome.send(\"reloadPolicies\")"}, s)
+        await asyncio.sleep(1)
+        await call("Target.closeTarget", {"targetId": t})
+asyncio.run(main())
+'
+
+if [ $# -gt 0 ]; then NAMES=$(printf 'dexbot-%s\n' "$@"); else NAMES=$(docker ps --format '{{.Names}}' | grep '^dexbot-'); fi
+for C in $NAMES; do
+  slug=${C#dexbot-}
+  if ! docker exec -u 0 "$C" mkdir -p "$OUT" /etc/opt/chrome/native-messaging-hosts /etc/opt/chrome/policies/managed 2>/dev/null; then
+    echo "skipped $slug: its computer is not running"; continue
+  fi
+  ok=1
+  for f in dex-passkeys.crx updates.xml; do docker cp -q "$OUT/$f" "$C:$OUT/$f" || ok=0; done
+  docker cp -q "$OUT/dex-passkeys-host" "$C:/usr/local/bin/dex-passkeys-host" || ok=0
+  docker cp -q "$OUT/ai.dex.passkeys.json" "$C:/etc/opt/chrome/native-messaging-hosts/ai.dex.passkeys.json" || ok=0
+  docker cp -q "$OUT/policy.json" "$C:/etc/opt/chrome/policies/managed/dex-passkeys.json" || ok=0
+  docker exec -u 0 "$C" sh -c "chown -R root:root $OUT /usr/local/bin/dex-passkeys-host /etc/opt/chrome/native-messaging-hosts/ai.dex.passkeys.json /etc/opt/chrome/policies/managed/dex-passkeys.json; chmod 755 /usr/local/bin/dex-passkeys-host $OUT; chmod 644 $OUT/* /etc/opt/chrome/native-messaging-hosts/ai.dex.passkeys.json /etc/opt/chrome/policies/managed/dex-passkeys.json" || ok=0
+  [ $ok = 1 ] || { echo "failed $slug: could not copy the files"; continue; }
+  timeout 25 docker exec -u kasm-user "$C" python3 -c "$RELOAD" >/dev/null 2>&1 \
+    && echo "ok $slug" || echo "ok $slug (Chrome is closed or busy: it reads the policy when it next starts)"
+done

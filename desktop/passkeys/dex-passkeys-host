@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""dex-passkeys-host: the helper Chrome starts for the Dex Passkeys extension (native messaging).
+
+It carries ONE question from the extension to the hub and the answer back, over the bot's own
+socket (~/.dex/passkey.sock, which only this bot's computer can reach). It keeps nothing.
+If Chrome closes it (the page gave up), it closes the socket, and the hub takes the question
+off the person's screen.
+"""
+import json, os, select, socket, struct, sys, time
+
+SOCK = os.path.expanduser("~/.dex/passkey.sock")
+WAIT = 150                                     # seconds: a little longer than the hub waits for the person
+NOT_ALLOWED = {"error": {"name": "NotAllowedError", "message": "The passkey request was not approved."}}
+
+
+def read():
+    raw = sys.stdin.buffer.read(4)
+    if len(raw) < 4:
+        return None
+    return json.loads(sys.stdin.buffer.read(struct.unpack("=I", raw)[0]))
+
+
+def write(msg):
+    data = json.dumps(msg).encode()
+    sys.stdout.buffer.write(struct.pack("=I", len(data)) + data)
+    sys.stdout.buffer.flush()
+
+
+def main():
+    msg = read()
+    if not msg:
+        return
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(SOCK)
+        s.sendall(json.dumps(msg).encode() + b"\n")
+    except OSError:
+        return write({"isUvpaa": False} if msg.get("kind") == "uvpaa" else NOT_ALLOWED)
+    buf, end = b"", time.time() + WAIT
+    while time.time() < end:
+        ready, _, _ = select.select([s, sys.stdin.buffer], [], [], max(0.1, end - time.time()))
+        if sys.stdin.buffer in ready:          # Chrome canceled, or closed us
+            s.close()
+            return
+        if s in ready:
+            try:
+                data = s.recv(65536)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            buf += data
+            if b"\n" in buf:
+                try:
+                    return write(json.loads(buf.split(b"\n")[0]))
+                except ValueError:
+                    break
+    s.close()
+    write({"isUvpaa": False} if msg.get("kind") == "uvpaa" else NOT_ALLOWED)
+
+
+if __name__ == "__main__":
+    main()
